@@ -1,6 +1,9 @@
 // Going to be using a simple synchronous threaded approach for this...
 //   new connection -> spawn thread...
 
+// https://developer.valvesoftware.com/wiki/Master_Server_Query_Protocol
+
+use anyhow::{Context, ensure};
 use atoi::atoi;
 use r2d2::Pool;
 use r2d2_sqlite::{SqliteConnectionManager, rusqlite::params};
@@ -8,7 +11,8 @@ use rand::{TryRngCore, rngs::OsRng};
 
 use std::{
 	collections::HashMap,
-	net::{SocketAddr, UdpSocket},
+	io::{Cursor, Write},
+	net::{SocketAddr, SocketAddrV4, UdpSocket},
 	sync::{LazyLock, mpsc},
 	time::{Duration, Instant},
 };
@@ -46,16 +50,14 @@ fn process_join(server_challenge: i32, msg: &[u8], peer_addr: SocketAddr, pool: 
 		std::net::IpAddr::V4(ipv4_addr) => ipv4_addr.to_bits(),
 		std::net::IpAddr::V6(_) => 0,
 	};
+	let port = peer_addr.port();
 
 	let players = atoi::<u8>(players)?;
 	let maxplayers = atoi::<u8>(maxplayers)?;
 	let bots = atoi::<u8>(bots)?;
 	let gamedir = std::str::from_utf8(gamedir).ok()?;
 	let map = std::str::from_utf8(map).ok()?;
-	let password = match atoi::<u8>(password)? {
-		v @ (0 | 1) => v,
-		_ => return None,
-	};
+	let password = atoi::<u8>(password)? == 1;
 	let linux = os == b"l";
 	let region = match atoi::<u8>(region)? {
 		v @ 0..=7 => v,
@@ -82,6 +84,7 @@ fn process_join(server_challenge: i32, msg: &[u8], peer_addr: SocketAddr, pool: 
 			addr
 			, ip
 			, region
+			, port
 			, time_registered
 			, dedicated
 			, secure
@@ -101,12 +104,13 @@ fn process_join(server_challenge: i32, msg: &[u8], peer_addr: SocketAddr, pool: 
 			, version
 			)
 			VALUES
-			(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+			(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 		",
 			params![
 				peer_addr.to_string(),
 				ip,
 				region,
+				port,
 				now,
 				dedicated,
 				secure,
@@ -139,10 +143,10 @@ fn handle_connection(
 ) -> anyhow::Result<()> {
 	println!("connection from {}", peer_addr);
 
-	let first_msg = receiver.recv()?;
+	let mut msg: Vec<u8> = receiver.recv()?;
 
-	if first_msg == b"q" {
-		// join list
+	// join list
+	if msg == b"q" {
 		loop {
 			let challenge = OsRng.try_next_u32()? as i32 & i32::MAX;
 			let mut challenge_msg = [0xFF, 0xFF, 0xFF, 0xFF, 0x73, 0x0A, 0, 0, 0, 0];
@@ -154,12 +158,42 @@ fn handle_connection(
 				return Ok(());
 			}
 		}
-	} else {
-		// query servers
 	}
 
+	let mut results: Option<Vec<SocketAddrV4>> = None;
+	// query servers
 	loop {
-		let msg = receiver.recv()?;
+		assert!(msg[0] == b'1');
+		let region = *msg.get(1).context("not enough buffer for the region")?;
+		ensure!(region == 0xFF || (0..=7).contains(&region));
+
+		let mut splits = (&msg[2..]).split_inclusive(|&v| v == b'\0');
+		let _query_addr: SocketAddrV4 = std::str::from_utf8(splits.next().context("malformed query")?)?.parse()?;
+		let filter = std::str::from_utf8(splits.next().context("malformed query filter")?)?;
+
+		let mut buf = [0u8; 1500];
+		let mut cur = Cursor::new(buf.as_mut());
+
+		if let Some(results) = &mut results {
+			// random header
+			let _ = cur.write(b"\xFF\xFF\xFF\xFF\x66\x0A");
+
+			// Fits under 6*232 (1392) + header (6) fits nicely under 1500 which is a nice number to be less than.
+			// I think the Steam master servers actually use 232 also but I'm too lazy to recheck.
+			const MAX_SERVERS_PER_DATAGRAM: usize = 232;
+
+			let mut servers_pushed = 0;
+			for result in results.iter().rev().take(MAX_SERVERS_PER_DATAGRAM) {
+				let _ = cur.write(&result.ip().to_bits().to_le_bytes());
+				let _ = cur.write(&result.port().to_be_bytes());
+				servers_pushed += 1;
+			}
+			results.truncate(results.len() - servers_pushed);
+		} else {
+			// query from sqlite
+		}
+
+		msg = receiver.recv()?;
 	}
 }
 
@@ -195,6 +229,7 @@ fn main() -> anyhow::Result<()> {
 		  addr TEXT PRIMARY KEY
 		, ip INT NOT NULL
 		, region INT NOT NULL
+		, port INT NOT NULL
 		, time_registered INT NOT NULL
 		, dedicated INT NOT NULL
 		, secure INT NOT NULL
