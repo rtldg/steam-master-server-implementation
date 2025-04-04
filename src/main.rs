@@ -1,6 +1,7 @@
 // Going to be using a simple synchronous threaded approach for this...
 //   new connection -> spawn thread...
 
+use atoi::atoi;
 use r2d2::Pool;
 use r2d2_sqlite::{SqliteConnectionManager, rusqlite::params};
 use rand::{TryRngCore, rngs::OsRng};
@@ -8,9 +9,127 @@ use rand::{TryRngCore, rngs::OsRng};
 use std::{
 	collections::HashMap,
 	net::{SocketAddr, UdpSocket},
-	sync::mpsc,
+	sync::{LazyLock, mpsc},
 	time::{Duration, Instant},
 };
+
+fn process_join(server_challenge: i32, msg: &[u8], peer_addr: SocketAddr, pool: &Pool<SqliteConnectionManager>) -> Option<()> {
+	static RE: LazyLock<regex::bytes::Regex> = LazyLock::new(|| {
+		regex::bytes::Regex::new(r"\x30\x0A\\protocol\\7\\challenge\\(\d+)\\players\\(\d+)\\max\\(\d+)\\bots\\(\d+)\\gamedir\\([^\\]+)\\map\\([^\\]+)\\password\\(\d)\\os\\(.)\\lan\\(\d)\\region\\(\d+)\\type\\(.)\\secure\\(\d)\\version\\([\\d\.]+)\\product\\([^\\]+)\x0A").unwrap()
+	});
+
+	let (
+		_full,
+		[
+			challenge,
+			players,
+			maxplayers,
+			bots,
+			gamedir,
+			map,
+			password,
+			os,
+			_lan,
+			region,
+			server_type,
+			secure,
+			version,
+			product,
+		],
+	) = RE.captures(msg)?.extract();
+
+	if challenge != format!("{server_challenge}").as_bytes() {
+		return None;
+	}
+
+	let ip = match peer_addr.ip() {
+		std::net::IpAddr::V4(ipv4_addr) => ipv4_addr.to_bits(),
+		std::net::IpAddr::V6(_) => 0,
+	};
+
+	let players = atoi::<u8>(players)?;
+	let maxplayers = atoi::<u8>(maxplayers)?;
+	let bots = atoi::<u8>(bots)?;
+	let gamedir = std::str::from_utf8(gamedir).ok()?;
+	let map = std::str::from_utf8(map).ok()?;
+	let password = match atoi::<u8>(password)? {
+		v @ (0 | 1) => v,
+		_ => return None,
+	};
+	let linux = os == b"l";
+	let region = match atoi::<u8>(region)? {
+		v @ 0..=7 => v,
+		0xFF => 0xFF,
+		_ => return None,
+	};
+	let dedicated = server_type == b"d";
+	let secure = atoi::<u8>(secure)? == 1;
+	let version = std::str::from_utf8(version).ok()?;
+	let product = std::str::from_utf8(product).ok()?;
+
+	let appid = match product {
+		"cstrike" => 240,
+		_ => return None,
+	};
+
+	let now = jiff::Timestamp::now().as_second();
+
+	pool.get()
+		.ok()?
+		.execute(
+			"
+			INSERT OR REPLACE INTO servers (
+			addr
+			, ip
+			, region
+			, time_registered
+			, dedicated
+			, secure
+			, linux
+			, password
+			, players
+			, maxplayers
+			, bots
+			, proxy
+			, appid
+			, white
+			, gamedir
+			, map
+			, gametype
+			, gamedata
+			, name
+			, version
+			)
+			VALUES
+			(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+		",
+			params![
+				peer_addr.to_string(),
+				ip,
+				region,
+				now,
+				dedicated,
+				secure,
+				linux,
+				password,
+				players,
+				maxplayers,
+				bots,
+				0, // hltv proxy
+				appid,
+				0, // whitelisted
+				gamedir,
+				map,
+				"", // gametype
+				"", // gamedata
+				"", // name
+				version
+			],
+		)
+		.ok()?;
+
+	Some(())
+}
 
 fn handle_connection(
 	receiver: mpsc::Receiver<Vec<u8>>,
@@ -25,13 +144,15 @@ fn handle_connection(
 	if first_msg == b"q" {
 		// join list
 		loop {
-			let challenge = OsRng.try_next_u32()?;
+			let challenge = OsRng.try_next_u32()? as i32 & i32::MAX;
 			let mut challenge_msg = [0xFF, 0xFF, 0xFF, 0xFF, 0x73, 0x0A, 0, 0, 0, 0];
 			let (_, r) = challenge_msg.split_at_mut(6);
 			r.copy_from_slice(&challenge.to_le_bytes());
 			let _ = socket.send_to(&challenge_msg, peer_addr)?;
 			let msg = receiver.recv()?;
-			// validate here...
+			if let Some(_) = process_join(challenge, &msg, peer_addr, &pool) {
+				return Ok(());
+			}
 		}
 	} else {
 		// query servers
@@ -68,27 +189,43 @@ fn main() -> anyhow::Result<()> {
 	let socket = UdpSocket::bind("0.0.0.0:27011")?;
 
 	let pool = r2d2::Pool::new(SqliteConnectionManager::memory())?;
-	pool.get()?.execute(
-		"CREATE TABLE IF NOT EXISTS servers (
-			  time_registered INT NOT NULL
-			, dedicated INT NOT NULL
-			, region INT NOT NULL
-			, secure INT NOT NULL
-			, linux INT NOT NULL
-			, password INT NOT NULL
-			, connected INT NOT NULL
-			, proxy INT NOT NULL
-			, appid INT NOT NULL
-			, white INT NOT NULL
-			, gamedir TEXT NOT NULL
-			, map TEXT NOT NULL
-			, gametype TEXT NOT NULL
-			, gamedata TEXT NOT NULL
-			, name TEXT NOT NULL,
-			, version TEXT NOT NULL
-			, addr TEXT NOT NULL
-			);",
-		params![],
+	pool.get()?.execute_batch(
+		"
+		CREATE TABLE IF NOT EXISTS servers (
+		  addr TEXT PRIMARY KEY
+		, ip INT NOT NULL
+		, region INT NOT NULL
+		, time_registered INT NOT NULL
+		, dedicated INT NOT NULL
+		, secure INT NOT NULL
+		, linux INT NOT NULL
+		, password INT NOT NULL
+		, players INT NOT NULL
+		, maxplayers INT NOT NULL
+		, bots INT NOT NULL
+		, proxy INT NOT NULL
+		, appid INT NOT NULL
+		, white INT NOT NULL
+		, gamedir TEXT NOT NULL
+		, map TEXT NOT NULL
+		, gametype TEXT NOT NULL
+		, gamedata TEXT NOT NULL
+		, name TEXT NOT NULL
+		, version TEXT NOT NULL
+		);
+
+		CREATE INDEX IF NOT EXISTS ip ON servers (ip);
+		CREATE INDEX IF NOT EXISTS region ON servers (region);
+		CREATE INDEX IF NOT EXISTS dedicated ON servers (dedicated);
+		CREATE INDEX IF NOT EXISTS secure ON servers (secure);
+		CREATE INDEX IF NOT EXISTS linux ON servers (linux);
+		CREATE INDEX IF NOT EXISTS password ON servers (password);
+		CREATE INDEX IF NOT EXISTS proxy ON servers (proxy);
+		CREATE INDEX IF NOT EXISTS appid ON servers (appid);
+		CREATE INDEX IF NOT EXISTS white ON servers (white);
+		CREATE INDEX IF NOT EXISTS gamedir ON servers (gamedir);
+		CREATE INDEX IF NOT EXISTS version ON servers (version);
+		",
 	)?;
 
 	std::thread::spawn({
@@ -113,6 +250,11 @@ fn main() -> anyhow::Result<()> {
 	loop {
 		let (count, peer_addr) = socket.recv_from(&mut buf)?;
 		let buf = &buf[..count];
+
+		// how?
+		if peer_addr.is_ipv6() {
+			continue;
+		}
 
 		if peer_addr.ip().is_loopback() {
 			if buf == b"clear" {
