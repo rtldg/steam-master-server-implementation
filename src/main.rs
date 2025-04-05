@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright 2025 rtldg <rtldg@protonmail.com>
+
 // Going to be using a simple synchronous threaded approach for this...
 //   new connection -> spawn thread...
 
@@ -230,7 +233,7 @@ fn convert_filter_to_sql(filter: &str, region: u8) -> Option<(String, Vec<String
 	}
 
 	if collapse_addr_hash {
-		todo!();
+		let _ = write!(sql, " GROUP BY ip");
 	}
 
 	// filter was missing filters...
@@ -251,6 +254,11 @@ fn handle_connection(
 	println!("connection from {}", peer_addr);
 
 	let mut msg: Vec<u8> = receiver.recv()?;
+
+	if msg == b"version" {
+		socket.send_to(concat!(env!("CARGO_PKG_REPOSITORY"), " ", env!("CARGO_PKG_VERSION"), "\0").as_bytes(), peer_addr)?;
+		return Ok(());
+	}
 
 	// join list
 	if msg == b"q" {
@@ -313,6 +321,10 @@ fn handle_connection(
 				servers_pushed += 1;
 			}
 			results.truncate(results.len() - servers_pushed);
+
+			let buflen = cur.position() as usize;
+			drop(cur);
+			socket.send_to(&buf[..buflen], peer_addr)?;
 
 			if results.len() == 0 {
 				// die
@@ -431,7 +443,7 @@ fn main() -> anyhow::Result<()> {
 				let _ = clients.remove(&peer_addr).unwrap();
 			}
 		} else {
-			if buf != b"q" && buf[0] != b'1' {
+			if buf != b"q" && buf != b"version" && buf[0] != b'1' {
 				continue;
 			}
 			let (sender, receiver) = mpsc::channel();

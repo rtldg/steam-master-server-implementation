@@ -1,7 +1,12 @@
 [package]
 name = "steam-master-server-implementation"
-version = "0.1.0"
+authors = ["rtldg <rtldg@protonmail.com>"]
+description = "Implementation of the Steam Master Server for game servers"
+version = "0.9.0"
 edition = "2024"
+license = "AGPL-3.0-or-later"
+homepage = "https://github.com/rtldg/steam-master-server-implementation"
+repository = "https://github.com/rtldg/steam-master-server-implementation"
 
 [dependencies]
 anyhow = { version = "1", features = ["backtrace"] }
