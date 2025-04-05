@@ -7,7 +7,6 @@
 // https://developer.valvesoftware.com/wiki/Master_Server_Query_Protocol
 
 use anyhow::{Context, ensure};
-use atoi::atoi;
 use r2d2::Pool;
 use r2d2_sqlite::rusqlite::ToSql;
 use r2d2_sqlite::{SqliteConnectionManager, rusqlite::params};
@@ -20,36 +19,12 @@ use std::{
 	collections::HashMap,
 	io::{Cursor, Write as IoWrite},
 	net::{SocketAddr, SocketAddrV4, UdpSocket},
-	sync::{LazyLock, mpsc},
+	sync::mpsc,
 	time::{Duration, Instant},
 };
 
 fn process_join(server_challenge: i32, msg: &[u8], peer_addr: SocketAddr, pool: &Pool<SqliteConnectionManager>) -> Option<()> {
-	static RE: LazyLock<regex::bytes::Regex> = LazyLock::new(|| {
-		regex::bytes::Regex::new(r"\x30\x0A\\protocol\\7\\challenge\\(\d+)\\players\\(\d+)\\max\\(\d+)\\bots\\(\d+)\\gamedir\\([^\\]+)\\map\\([^\\]+)\\password\\(\d)\\os\\(.)\\lan\\(\d)\\region\\(\d+)\\type\\(.)\\secure\\(\d)\\version\\([\\d\.]+)\\product\\([^\\]+)\x0A").unwrap()
-	});
-
-	let (
-		_full,
-		[
-			challenge,
-			players,
-			maxplayers,
-			bots,
-			gamedir,
-			map,
-			password,
-			os,
-			_lan,
-			region,
-			server_type,
-			secure,
-			version,
-			product,
-		],
-	) = RE.captures(msg)?.extract();
-
-	if challenge != format!("{server_challenge}").as_bytes() {
+	if &msg[0..2] != b"\x30\x0A" {
 		return None;
 	}
 
@@ -59,27 +34,90 @@ fn process_join(server_challenge: i32, msg: &[u8], peer_addr: SocketAddr, pool: 
 	};
 	let port = peer_addr.port();
 
-	let players = atoi::<u8>(players)?;
-	let maxplayers = atoi::<u8>(maxplayers)?;
-	let bots = atoi::<u8>(bots)?;
-	let gamedir = std::str::from_utf8(gamedir).ok()?;
-	let map = std::str::from_utf8(map).ok()?;
-	let password = atoi::<u8>(password)? == 1;
-	let linux = os == b"l";
-	let region = match atoi::<u8>(region)? {
-		v @ 0..=7 => v,
-		0xFF => 0xFF,
-		_ => return None,
-	};
-	let dedicated = server_type == b"d";
-	let secure = atoi::<u8>(secure)? == 1;
-	let version = std::str::from_utf8(version).ok()?;
-	let product = std::str::from_utf8(product).ok()?;
+	let mut protocol = 0u8;
+	let mut challenge = -1i32;
+	let mut players = 0u8;
+	let mut maxplayers = 0u8;
+	let mut bots = 0u8;
+	let mut gamedir = "";
+	let mut map = "";
+	let mut password = false;
+	let mut linux = false;
+	let mut region = 0xFFu8;
+	let mut dedicated = true;
+	let mut secure = false;
+	let mut version = "";
+	//let mut product = "";
+	// custom...
+	let mut appid = 0u64;
+	let mut gametype = "";
+	let mut gamedata = "";
+	let mut hostname = "";
 
-	let appid = match product {
-		"cstrike" => 240,
-		_ => return None,
-	};
+	// utf8 here will break some server names that use funky ascii characters
+	let msg = std::str::from_utf8(&msg[2..]).ok()?;
+	let mut splits = msg.split('\\');
+
+	while let Some(key) = splits.next() {
+		let value = splits.next()?;
+		if key == "protocol" {
+			protocol = value.parse().ok()?;
+		} else if key == "challenge" {
+			challenge = value.parse().ok()?;
+		} else if key == "players" {
+			players = value.parse().ok()?;
+		} else if key == "max" {
+			maxplayers = value.parse().ok()?;
+		} else if key == "bots" {
+			bots = value.parse().ok()?;
+		} else if key == "gamedir" {
+			gamedir = value;
+		} else if key == "map" {
+			map = value;
+		} else if key == "password" {
+			password = value.parse::<u8>().ok()? == 1;
+		} else if key == "os" {
+			linux = value != "w";
+		} else if key == "lan" {
+			// we don't care
+		} else if key == "region" {
+			region = match value.parse().ok()? {
+				v @ 0..=7 => v,
+				0xFF => 0xFF,
+				_ => return None,
+			};
+		} else if key == "type" {
+			dedicated = value == "d";
+		} else if key == "secure" {
+			secure = value.parse::<u8>().ok()? == 1;
+		} else if key == "version" {
+			version = value;
+		} /*else if key == "product" {
+		product = value;
+		}*/
+		// custom fields now:
+		if key == "appid" {
+			appid = value.parse().ok()?;
+		} else if key == "gametype" {
+			// for tags
+			gametype = value;
+		} else if key == "gamedata" {
+			// 'hidden' tags
+			gamedata = value;
+		} else if key == "hostname" {
+			// server name
+			hostname = value;
+		}
+	}
+
+	if challenge != server_challenge {
+		return None;
+	}
+
+	// TODO: should we just bump the protocol lol? If we were to then more of the protocol should be changed since it kind of sucks in couple ways.
+	if protocol != 7 {
+		return None;
+	}
 
 	let now = jiff::Timestamp::now().as_second();
 
@@ -107,7 +145,7 @@ fn process_join(server_challenge: i32, msg: &[u8], peer_addr: SocketAddr, pool: 
 			, map
 			, gametype
 			, gamedata
-			, name
+			, hostname
 			, version
 			)
 			VALUES
@@ -131,9 +169,9 @@ fn process_join(server_challenge: i32, msg: &[u8], peer_addr: SocketAddr, pool: 
 				0, // whitelisted
 				gamedir,
 				map,
-				"", // gametype
-				"", // gamedata
-				"", // name
+				gametype,
+				gamedata,
+				hostname,
 				version,
 			],
 		)
@@ -256,7 +294,10 @@ fn handle_connection(
 	let mut msg: Vec<u8> = receiver.recv()?;
 
 	if msg == b"version" {
-		socket.send_to(concat!(env!("CARGO_PKG_REPOSITORY"), " ", env!("CARGO_PKG_VERSION"), "\0").as_bytes(), peer_addr)?;
+		socket.send_to(
+			concat!(env!("CARGO_PKG_REPOSITORY"), " ", env!("CARGO_PKG_VERSION"), "\0").as_bytes(),
+			peer_addr,
+		)?;
 		return Ok(());
 	}
 
@@ -384,7 +425,7 @@ fn main() -> anyhow::Result<()> {
 		, map TEXT NOT NULL
 		, gametype TEXT NOT NULL
 		, gamedata TEXT NOT NULL
-		, name TEXT NOT NULL
+		, hostname TEXT NOT NULL
 		, version TEXT NOT NULL
 		);
 

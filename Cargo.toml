@@ -2,7 +2,7 @@
 name = "steam-master-server-implementation"
 authors = ["rtldg <rtldg@protonmail.com>"]
 description = "Implementation of the Steam Master Server for game servers"
-version = "0.9.0"
+version = "0.9.1"
 edition = "2024"
 license = "AGPL-3.0-or-later"
 homepage = "https://github.com/rtldg/steam-master-server-implementation"
@@ -14,5 +14,3 @@ rand = "0.9.0"
 r2d2 = "0.8.10"
 r2d2_sqlite = { version = "0.27", features = ["bundled"] }
 jiff = "0.2.5"
-atoi = "2.0.0"
-regex = "1.11.1"
