@@ -6,12 +6,16 @@
 use anyhow::{Context, ensure};
 use atoi::atoi;
 use r2d2::Pool;
+use r2d2_sqlite::rusqlite::ToSql;
 use r2d2_sqlite::{SqliteConnectionManager, rusqlite::params};
 use rand::{TryRngCore, rngs::OsRng};
 
+use std::fmt::Write as FmtWrite;
+
+use std::net::Ipv4Addr;
 use std::{
 	collections::HashMap,
-	io::{Cursor, Write},
+	io::{Cursor, Write as IoWrite},
 	net::{SocketAddr, SocketAddrV4, UdpSocket},
 	sync::{LazyLock, mpsc},
 	time::{Duration, Instant},
@@ -127,12 +131,115 @@ fn process_join(server_challenge: i32, msg: &[u8], peer_addr: SocketAddr, pool: 
 				"", // gametype
 				"", // gamedata
 				"", // name
-				version
+				version,
 			],
 		)
 		.ok()?;
 
 	Some(())
+}
+
+fn convert_filter_to_sql(filter: &str, region: u8) -> Option<(String, Vec<String>)> {
+	let mut sql = "SELECT ip, port FROM servers WHERE".to_string();
+	let mut params = vec![];
+
+	if region == 0xFF {
+		let _ = write!(sql, " region >= 0"); // catchall just so we always have a WHERE...
+	} else {
+		let _ = write!(sql, " region = {region}");
+	}
+
+	let mut nor_count = 0;
+	let mut nand_count = 0;
+	let mut collapse_addr_hash = false;
+
+	let mut splits = filter.split('\\');
+	let simple_ints = ["dedicated", "secure", "linux", "password", "proxy", "white", "appid"];
+	let simple_strings = ["gamedir", "map"];
+
+	let mut op = "AND";
+
+	while let Some(key) = splits.next() {
+		let value = splits.next()?;
+		if key == "nor" {
+			if nor_count != 0 || nand_count != 0 {
+				return None;
+			}
+			nor_count = value.parse::<u32>().ok()?;
+			op = "OR";
+			let _ = write!(sql, "AND NOT (");
+		} else if key == "nand" {
+			if nor_count != 0 || nand_count != 0 {
+				return None;
+			}
+			nand_count = value.parse::<u32>().ok()?;
+			let _ = write!(sql, "AND NOT (");
+		} else if simple_ints.contains(&key) {
+			let _ = write!(sql, " {op} {key} = {}", value.parse::<u64>().ok()?);
+		} else if simple_strings.contains(&key) {
+			let _ = write!(sql, " {op} {key} = ?");
+			params.push(value.to_string());
+		} else if key == "empty" {
+			let _ = write!(sql, " {op} players = 0");
+		} else if key == "full" {
+			let _ = write!(sql, " {op} (players+bots) >= maxplayers");
+		} else if key == "napp" {
+			let _ = write!(sql, " {op} appid != {}", value.parse::<u64>().ok()?);
+		} else if key == "noplayers" {
+			let _ = write!(sql, " {op} players = 0");
+		} else if key == "gametype" {
+			todo!();
+		} else if key == "gamedata" {
+			todo!();
+		} else if key == "gamedataor" {
+			todo!();
+		} else if key == "name_match" {
+			todo!();
+		} else if key == "version_match" {
+			todo!();
+		} else if key == "collapse_addr_hash" {
+			collapse_addr_hash = true;
+		} else if key == "gameaddr" {
+			let (ip, port) = if value.contains(':') {
+				let addr = value.parse::<SocketAddrV4>().ok()?;
+				(addr.ip().to_bits(), addr.port())
+			} else {
+				let ip = value.parse::<Ipv4Addr>().ok()?;
+				(ip.to_bits(), 0)
+			};
+			let _ = write!(sql, " {op} (ip = {ip}");
+			if port != 0 {
+				let _ = write!(sql, " AND port = {port}");
+			}
+			let _ = write!(sql, ")");
+		}
+
+		if nor_count > 0 && key != "nor" {
+			nor_count -= 1;
+			if nor_count == 0 {
+				op = "AND";
+				let _ = write!(sql, ")");
+			}
+		}
+		if nand_count > 0 && key != "nand" {
+			nand_count -= 1;
+			if nand_count == 0 {
+				let _ = write!(sql, ")");
+			}
+		}
+	}
+
+	if collapse_addr_hash {
+		todo!();
+	}
+
+	// filter was missing filters...
+	if nor_count > 0 || nand_count > 0 {
+		return None;
+	}
+
+	sql.push(';');
+	Some((sql, params))
 }
 
 fn handle_connection(
@@ -174,6 +281,23 @@ fn handle_connection(
 		let mut buf = [0u8; 1500];
 		let mut cur = Cursor::new(buf.as_mut());
 
+		if results.is_none() {
+			let (query, string_params) = convert_filter_to_sql(filter, region).context("failed to convert filter to sql")?;
+			let sql_params: Vec<&dyn ToSql> = string_params.iter().map(|x| x as &dyn ToSql).collect();
+			let pool = pool.get().unwrap();
+			let mut stmt = pool.prepare(&query)?;
+			let mut addrs = vec![];
+			let mut rows = stmt.query(&*sql_params)?;
+			while let Ok(Some(r)) = rows.next() {
+				addrs.push(SocketAddrV4::new(Ipv4Addr::from_bits(r.get(0)?), r.get(1)?));
+			}
+			// 0.0.0.0:0 is used to flag the end of the list
+			addrs.push(SocketAddrV4::new(Ipv4Addr::from_bits(0), 0));
+			// we pop items off the end of the vec, so we want it reversed...
+			addrs.reverse();
+			results = Some(addrs);
+		}
+
 		if let Some(results) = &mut results {
 			// random header
 			let _ = cur.write(b"\xFF\xFF\xFF\xFF\x66\x0A");
@@ -189,8 +313,11 @@ fn handle_connection(
 				servers_pushed += 1;
 			}
 			results.truncate(results.len() - servers_pushed);
-		} else {
-			// query from sqlite
+
+			if results.len() == 0 {
+				// die
+				return Ok(());
+			}
 		}
 
 		msg = receiver.recv()?;
