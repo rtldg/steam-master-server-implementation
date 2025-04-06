@@ -23,6 +23,18 @@ use std::{
 	time::{Duration, Instant},
 };
 
+fn simple_tag_cleaner(tags: &str) -> Vec<String> {
+	tags.split(',')
+		.filter(|s| !s.is_empty())
+		.map(|s| {
+			s.chars()
+				.filter(|c| c.is_ascii_alphanumeric())
+				.map(|c| c.to_ascii_lowercase())
+				.collect()
+		})
+		.collect()
+}
+
 fn process_join(server_challenge: i32, msg: &[u8], peer_addr: SocketAddr, pool: &Pool<SqliteConnectionManager>) -> Option<()> {
 	if &msg[0..2] != b"\x30\x0A" {
 		return None;
@@ -46,12 +58,12 @@ fn process_join(server_challenge: i32, msg: &[u8], peer_addr: SocketAddr, pool: 
 	let mut region = 0xFFu8;
 	let mut dedicated = true;
 	let mut secure = false;
-	let mut version = "";
+	let mut version = String::new();
 	//let mut product = "";
 	// custom...
 	let mut appid = 0u64;
-	let mut gametype = "";
-	let mut gamedata = "";
+	let mut gametype = String::new();
+	let mut gamedata = String::new();
 	let mut hostname = "";
 
 	// utf8 here will break some server names that use funky ascii characters
@@ -91,7 +103,7 @@ fn process_join(server_challenge: i32, msg: &[u8], peer_addr: SocketAddr, pool: 
 		} else if key == "secure" {
 			secure = value.parse::<u8>().ok()? == 1;
 		} else if key == "version" {
-			version = value;
+			version = value.chars().filter(|c| c.is_ascii_digit() || *c == '.').collect();
 		} /*else if key == "product" {
 		product = value;
 		}*/
@@ -99,11 +111,17 @@ fn process_join(server_challenge: i32, msg: &[u8], peer_addr: SocketAddr, pool: 
 		if key == "appid" {
 			appid = value.parse().ok()?;
 		} else if key == "gametype" {
-			// for tags
-			gametype = value;
+			// for sv_tags
+			let mut easily_searchable_tags = simple_tag_cleaner(value).join(",");
+			easily_searchable_tags.insert(0, ',');
+			easily_searchable_tags.push(',');
+			gametype = easily_searchable_tags;
 		} else if key == "gamedata" {
-			// 'hidden' tags
-			gamedata = value;
+			// 'hidden' tags (L4D2.. what are these?)
+			let mut easily_searchable_tags = simple_tag_cleaner(value).join(",");
+			easily_searchable_tags.insert(0, ',');
+			easily_searchable_tags.push(',');
+			gamedata = easily_searchable_tags;
 		} else if key == "hostname" {
 			// server name
 			hostname = value;
@@ -228,16 +246,20 @@ fn convert_filter_to_sql(filter: &str, region: u8) -> Option<(String, Vec<String
 			let _ = write!(sql, " {op} appid != {}", value.parse::<u64>().ok()?);
 		} else if key == "noplayers" {
 			let _ = write!(sql, " {op} players = 0");
-		} else if key == "gametype" {
-			todo!();
-		} else if key == "gamedata" {
-			todo!();
-		} else if key == "gamedataor" {
-			todo!();
-		} else if key == "name_match" {
-			todo!();
-		} else if key == "version_match" {
-			todo!();
+		} else if key == "gametype" || key == "gamedata" || key == "gamedataor" {
+			let inner_op = if key == "gamedataor" { "OR" } else { "AND" };
+			let tags = simple_tag_cleaner(value);
+			if tags.is_empty() {
+				return None;
+			}
+			let _ = write!(sql, " {op} (instr({key}, ',{},')", tags[0]);
+			for tag in tags {
+				let _ = write!(sql, " {inner_op} instr({key}, ',{tag},')");
+			}
+			let _ = write!(sql, ")");
+		} else if key == "name_match" || key == "version_match" {
+			let _ = write!(sql, " {op} {key} LIKE ?");
+			params.push(value.replace('*', "%"));
 		} else if key == "collapse_addr_hash" {
 			collapse_addr_hash = true;
 		} else if key == "gameaddr" {
