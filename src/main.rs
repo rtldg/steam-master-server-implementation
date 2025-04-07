@@ -258,6 +258,7 @@ fn convert_filter_to_sql(filter: &str, region: u8) -> Option<(String, Vec<String
 			}
 			let _ = write!(sql, ")");
 		} else if key == "name_match" || key == "version_match" {
+			let key = if key == "name_match" { "hostname" } else { "version" };
 			let _ = write!(sql, " {op} {key} LIKE ?");
 			params.push(value.replace('*', "%"));
 		} else if key == "collapse_addr_hash" {
