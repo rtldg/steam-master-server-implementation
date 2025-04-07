@@ -2,7 +2,7 @@
 name = "steam-master-server-implementation"
 authors = ["rtldg <rtldg@protonmail.com>"]
 description = "Implementation of the Steam Master Server for game servers"
-version = "1.0.1"
+version = "1.0.2"
 edition = "2024"
 license = "AGPL-3.0-or-later"
 homepage = "https://github.com/rtldg/steam-master-server-implementation"

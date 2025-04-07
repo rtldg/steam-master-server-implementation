@@ -248,6 +248,7 @@ fn convert_filter_to_sql(filter: &str, region: u8) -> Option<(String, Vec<String
 			let _ = write!(sql, " {op} players = 0");
 		} else if key == "gametype" || key == "gamedata" || key == "gamedataor" {
 			let inner_op = if key == "gamedataor" { "OR" } else { "AND" };
+			let key = if key == "gamedataor" { "gamedata" } else { key };
 			let tags = simple_tag_cleaner(value);
 			if tags.is_empty() {
 				return None;
