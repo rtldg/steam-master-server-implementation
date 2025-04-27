@@ -12,12 +12,12 @@ use r2d2_sqlite::rusqlite::ToSql;
 use r2d2_sqlite::{SqliteConnectionManager, rusqlite::params};
 use rand::{TryRngCore, rngs::OsRng};
 
-use std::fmt::Write as FmtWrite;
+use std::fmt::Write as _;
 
 use std::net::Ipv4Addr;
 use std::{
 	collections::HashMap,
-	io::{Cursor, Write as IoWrite},
+	io::{Cursor, Write as _},
 	net::{SocketAddr, SocketAddrV4, UdpSocket},
 	sync::mpsc,
 	time::{Duration, Instant},
