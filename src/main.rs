@@ -35,15 +35,12 @@ fn simple_tag_cleaner(tags: &str) -> Vec<String> {
 		.collect()
 }
 
-fn process_join(server_challenge: i32, msg: &[u8], peer_addr: SocketAddr, pool: &Pool<SqliteConnectionManager>) -> Option<()> {
+fn process_join(server_challenge: i32, msg: &[u8], peer_addr: SocketAddrV4, pool: &Pool<SqliteConnectionManager>) -> Option<()> {
 	if &msg[0..2] != b"\x30\x0A" {
 		return None;
 	}
 
-	let ip = match peer_addr.ip() {
-		std::net::IpAddr::V4(ipv4_addr) => ipv4_addr.to_bits(),
-		std::net::IpAddr::V6(_) => 0,
-	};
+	let ip = peer_addr.ip().to_bits();
 	let port = peer_addr.port();
 
 	let mut protocol = 0u8;
@@ -139,8 +136,9 @@ fn process_join(server_challenge: i32, msg: &[u8], peer_addr: SocketAddr, pool: 
 
 	let now = jiff::Timestamp::now().as_second();
 
-	pool.get()
-		.ok()?
+	let mut conn = pool.get().ok()?;
+	let trans = conn.transaction().ok()?;
+	trans
 		.execute(
 			"
 			INSERT OR REPLACE INTO servers (
@@ -194,6 +192,28 @@ fn process_join(server_challenge: i32, msg: &[u8], peer_addr: SocketAddr, pool: 
 			],
 		)
 		.ok()?;
+
+	// Dumb to include but worth making note of...
+	if !peer_addr.ip().is_link_local() {
+		trans
+			.execute(
+				"
+				DELETE FROM servers
+				WHERE ip = ?
+				AND addr NOT IN (
+					SELECT addr
+					FROM servers
+					WHERE ip = ?
+					ORDER BY time_registered
+					LIMIT 20
+				);
+			",
+				(ip, ip),
+			)
+			.ok()?;
+	}
+
+	trans.commit().ok()?;
 
 	Some(())
 }
@@ -310,7 +330,7 @@ fn convert_filter_to_sql(filter: &str, region: u8) -> Option<(String, Vec<String
 fn handle_connection(
 	receiver: mpsc::Receiver<Vec<u8>>,
 	socket: UdpSocket,
-	peer_addr: SocketAddr,
+	peer_addr: SocketAddrV4,
 	pool: Pool<SqliteConnectionManager>,
 ) -> anyhow::Result<()> {
 	println!("connection from {}", peer_addr);
@@ -483,17 +503,17 @@ fn main() -> anyhow::Result<()> {
 		sender: mpsc::Sender<Vec<u8>>,
 		last_msg: Instant,
 	}
-	let mut clients: HashMap<SocketAddr, ClientInfo> = Default::default();
+	let mut clients: HashMap<SocketAddrV4, ClientInfo> = Default::default();
 
 	let mut buf = [0u8; 10000];
 	loop {
 		let (count, peer_addr) = socket.recv_from(&mut buf)?;
 		let buf = &buf[..count];
 
-		// how?
-		if peer_addr.is_ipv6() {
+		let SocketAddr::V4(peer_addr) = peer_addr else {
+			// how is it ipv6?
 			continue;
-		}
+		};
 
 		if peer_addr.ip().is_loopback() {
 			if buf == b"clear" {
